@@ -97,19 +97,58 @@ The same database is retained through three phases:
 
 | Phase | Binary | Extension schema | Assertions |
 |-------|--------|------------------|------------|
-| Baseline | N-1 | N-1 | Complete one instance and hold two at durable signal subscriptions; check results, captured variables, owner and side effects. |
-| B1 | N | N-1 | Restart with the candidate binary without `ALTER EXTENSION`; revalidate old instances, resume one, and create both completed and waiting instances. |
-| B2 | N | N | Run `ALTER EXTENSION UPDATE`; revalidate both cohorts, resume instances created before and after the binary swap, and execute a new instance. |
+| Baseline | N-1 | N-1 | For every behavior family, hold two instances at a durable suspension inside the shape; also complete one `seq` instance. Check results, captured variables, owner and side effects. |
+| B1 | N | N-1 | Restart with the candidate binary without `ALTER EXTENSION`; revalidate suspended instances, resume each family's first instance, and create both a completed `seq` instance and a suspended `seq-binary-b2` instance. |
+| B2 | N | N | Run `ALTER EXTENSION UPDATE`; revalidate, resume each family's second instance and `seq-binary-b2`, and execute a new instance. |
 
-Each waiting instance has a recorded first SQL result and a persisted signal
-subscription before the transition. The continuation must use that captured
-result. Exact effect rows and a unique `(label, step)` key detect missing,
-reordered or duplicate execution; completed outputs must remain byte-identical.
+The additional `seq-binary-b2` instance preserves the original lifecycle's
+new-binary/old-schema to new-binary/new-schema scenario. Together with the
+N-1 family instances, it verifies that histories created both before and after
+the binary swap survive the schema upgrade. The final phase validates 18 instances.
+
+#### Behavior-family coverage
+
+Each suspended instance belongs to one behavior family, and every family is
+resumed once under B1 and once under B2, so replay is exercised across both
+boundaries. The families mirror the nested DSL combinators and the explicit
+else and break seeds in the fixed shape corpus
+([tests/e2e/shapes](../tests/e2e/shapes/README.md)); `df.sql` is exercised by
+every family:
+
+| Family | Suspension point | What replay must preserve |
+|--------|------------------|---------------------------|
+| `seq` | Between two sequenced markers | Ordered continuation and the captured variable |
+| `if-then` | Inside the taken then-branch | Branch selection; the else marker stays unrun |
+| `if-else` | Inside the taken else-branch | Explicit else selection; the then marker stays unrun |
+| `loop` | During the first iteration | Iteration state; later iterations run exactly once each |
+| `break` | During logical iteration 1, before breaking on iteration 3 | Captured iteration state and exactly one marker for each of iterations 1, 2, 3 |
+| `join` | One branch done, one suspended | The completed branch is not re-run on resume |
+| `race` | Winner suspended, loser on a durably recorded long timer | Race resolution; the loser reaches terminal cancellation and never marks |
+
+Each family records path-tagged marker rows with a `(label, path, occurrence)`
+key, and the harness asserts exact per-path counts — including zero-count paths
+for unrun branches and cancelled losers — before and after resume. The `break`
+family uses a captured logical iteration counter independent of marker counts,
+and asserts marker values `[1]` before resume and `[1, 2, 3]` afterward. Duplicating
+an effect cannot advance the break condition and hide a missing iteration.
+The `race` family checks the exact loser child's current provider execution:
+it must be running with a recorded `TimerCreated` before resume, then reach
+`failed` with an `OrchestrationFailed` application `Cancelled` error afterward.
+An absent marker alone is not evidence of cancellation while the timer sleeps.
+The `seq` family additionally records a first SQL result and a
+persisted signal subscription before the transition; its continuation must reuse
+that captured result and the start-time variable capture even though the live
+variables changed. Its first marker must equal `41` both before and after resume,
+and its continuation must equal `42`. Both markers resolve `{sys_label}` at
+execution time rather than embedding the label during graph construction.
+Completed outputs must remain byte-identical across phases.
 Checks exercise `df.status`, `df.result`, `df.list_instances` and
 `df.instance_info` as an ordinary granted role, and also check provider status
 so a stale extension status cannot hide a replay failure.
 
-This is **not** a historical release chain. Guarantee A, the all-supported-schema
+This is **not** a historical release chain, nor does it transplant the full
+shape corpus: it covers one in-flight instance per family through both upgrade
+boundaries, not every nested permutation. Guarantee A, the all-supported-schema
 B1 matrix and the existing B2 catalog/grant checks remain in place. The new
 lifecycle adds real previous-binary evidence for N-1 only; it does not establish
 replay compatibility with every older binary.

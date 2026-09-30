@@ -21,6 +21,38 @@ import tomllib
 PROJECT = Path(__file__).resolve().parents[1]
 ROLE = "upgrade_lifecycle_user"
 
+# Behavior families, each exercised by an N-1 instance suspended inside that
+# structure and resumed under both the B1 (new binary / old schema) and B2
+# (new binary / new schema) boundaries. Every #410 combinator plus the explicit
+# else and break seeds is represented; df.sql is exercised by every shape.
+FAMILIES = ["seq", "if-then", "if-else", "loop", "break", "join", "race"]
+
+# Exact marker counts per structural path while the instance is still suspended
+# ("before") and after it resumes and completes ("after"). Paths absent from a
+# map are expected to have zero rows, so an unrun branch, a cancelled race loser,
+# or a replayed duplicate is rejected. "captured" asserts that a completed value
+# reused the pre-suspension variable capture; "result" pins the instance output.
+SHAPES = {
+    "seq": {"before": {"r.0": 1}, "after": {"r.0": 1, "r.1": 1},
+            "before_values": {"r.0": [41]}, "after_values": {"r.0": [41]},
+            "captured": {"r.1": 42},
+            "result": {"rows": [{"value": 42}], "row_count": 1}},
+    "if-then": {"before": {"r.t.0": 1}, "after": {"r.t.0": 1, "r.t.1": 1}},
+    "if-else": {"before": {"r.e.0": 1}, "after": {"r.e.0": 1, "r.e.1": 1}},
+    "loop": {"before": {"r.b": 1}, "after": {"r.b": 2, "r.c": 2}},
+    "break": {"before": {"r.0": 1}, "after": {"r.0": 3},
+              "before_values": {"r.0": [1]}, "after_values": {"r.0": [1, 2, 3]}},
+    "join": {"before": {"r.0": 1, "r.b": 1}, "after": {"r.0": 1, "r.b": 1, "r.1": 1}},
+    "race": {"before": {"r.w": 1}, "after": {"r.w": 1, "r.w2": 1}},
+}
+
+
+def path_counts(marks):
+    counts = {}
+    for mark in marks:
+        counts[mark["path"]] = counts.get(mark["path"], 0) + 1
+    return counts
+
 
 def run(*args, cwd=None, env=None):
     return subprocess.run(
@@ -141,17 +173,28 @@ class Cluster:
             time.sleep(0.1)
         raise RuntimeError(f"Worker readiness timed out; see {self.log}")
 
-    def start_cases(self, cohort, waits):
-        self.sql("SELECT df.setvar('lifecycle_seed', '41'); "
-                 "SELECT df.setvar('lifecycle_increment', '1');", role=ROLE)
-        for suffix, waiting in [("completed", False), *[(name, True) for name in waits]]:
-            name = f"{cohort}-{suffix}"
-            self.sql(
-                f"SELECT public.upgrade_lifecycle_start({literal(name)}, "
-                f"{'true' if waiting else 'false'});", role=ROLE)
-        # A resumed instance must use its captured variables, not the current value.
-        self.sql("SELECT df.setvar('lifecycle_seed', '999'); "
-                 "SELECT df.setvar('lifecycle_increment', '999');", role=ROLE)
+    def set_vars(self, seed, increment):
+        self.sql(f"SELECT df.setvar('lifecycle_seed', {literal(str(seed))}); "
+                 f"SELECT df.setvar('lifecycle_increment', {literal(str(increment))});",
+                 role=ROLE)
+
+    def start_case(self, name, shape, waiting):
+        self.sql(f"SELECT public.upgrade_lifecycle_start({literal(name)}, {literal(shape)}, "
+                 f"{'true' if waiting else 'false'});", role=ROLE)
+
+    def seed_families(self):
+        # Capture 41/1 into every waiting instance, then move the live variables
+        # so a correct resume must reuse the captured values, not the current ones.
+        self.set_vars(41, 1)
+        for family in FAMILIES:
+            self.start_case(f"{family}-b1", family, True)
+            self.start_case(f"{family}-b2", family, True)
+        self.set_vars(999, 999)
+
+    def start_sequence(self, name, waiting=False):
+        self.set_vars(41, 1)
+        self.start_case(name, "seq", waiting)
+        self.set_vars(999, 999)
 
     def release(self, name):
         self.sql(f"SELECT df.signal(instance_id, 'resume', '{{}}') "
@@ -171,19 +214,46 @@ class Cluster:
                             WHERE l.instance_id=c.instance_id) AS listed,
                     lower(e.status) AS engine_status,
                     e.output AS engine_output,
+                    loser.instance_id AS race_loser_id,
+                    lower(loser_e.status) AS race_loser_status,
                     EXISTS (SELECT FROM {self.schema}.history h
-                            WHERE h.instance_id=c.instance_id
-                              AND h.execution_id=i.current_execution_id
+                            WHERE h.instance_id=loser.instance_id
+                              AND h.execution_id=loser.current_execution_id
+                              AND h.event_data::jsonb->>'type'='TimerCreated')
+                        AS race_loser_timer_created,
+                    -- Duroxide persists cancellation as an application failure,
+                    -- not a separate execution status.
+                    EXISTS (SELECT FROM {self.schema}.history h
+                            WHERE h.instance_id=loser.instance_id
+                              AND h.execution_id=loser.current_execution_id
+                              AND h.event_data::jsonb->>'type'='OrchestrationFailed'
+                              AND h.event_data::jsonb
+                                  #> '{{details,Application,kind,Cancelled}}' IS NOT NULL)
+                        AS race_loser_cancelled,
+                    -- The 'resume' subscription is durable in the root execution
+                    -- for simple shapes, or in a spawned join/race branch whose
+                    -- child instance id is prefixed with the root id.
+                    EXISTS (SELECT FROM {self.schema}.history h
+                            WHERE ((h.instance_id=c.instance_id
+                                    AND h.execution_id=i.current_execution_id)
+                                   OR h.instance_id LIKE c.instance_id || '::%')
                               AND h.event_data::jsonb->>'type'='ExternalSubscribed'
                               AND h.event_data::jsonb->>'name'='resume') AS subscribed,
                     coalesce((SELECT jsonb_agg(jsonb_build_object(
-                        'step', m.step, 'value', m.value, 'executed_by', m.executed_by)
-                        ORDER BY m.step) FROM public.upgrade_lifecycle_marks m
+                        'path', m.path, 'occurrence', m.occurrence,
+                        'value', m.value, 'executed_by', m.executed_by)
+                        ORDER BY m.path, m.occurrence) FROM public.upgrade_lifecycle_marks m
                         WHERE m.label=c.name), '[]'::jsonb) AS marks
                 FROM public.upgrade_lifecycle_cases c
                 LEFT JOIN {self.schema}.instances i ON i.instance_id=c.instance_id
                 LEFT JOIN {self.schema}.executions e ON e.instance_id=i.instance_id
                     AND e.execution_id=i.current_execution_id
+                LEFT JOIN df.nodes race ON c.shape='race'
+                    AND race.instance_id=c.instance_id AND race.node_type='RACE'
+                LEFT JOIN {self.schema}.instances loser ON loser.instance_id=
+                    c.instance_id || '::' || i.current_execution_id::text || '::' || race.right_node
+                LEFT JOIN {self.schema}.executions loser_e ON loser_e.instance_id=loser.instance_id
+                    AND loser_e.execution_id=loser.current_execution_id
             ) c;
         """, role=ROLE))
 
@@ -208,24 +278,46 @@ class Cluster:
 
 def case_problems(case, completed):
     problems = []
-    expected_status = "running" if case["waiting"] else "completed"
+    shape = SHAPES[case["shape"]]
+    waiting = case["waiting"]
+    expected_status = "running" if waiting else "completed"
     if any(case[key] != expected_status for key in ("status", "engine_status", "info_status")):
         problems.append(f"expected {expected_status} in all monitoring surfaces")
     if not case["listed"]:
         problems.append("missing from df.list_instances")
-    expected_marks = [
-        {"step": step, "value": 40 + step, "executed_by": ROLE}
-        for step in range(1, 2 if case["waiting"] else 3)
-    ]
-    if case["marks"] != expected_marks:
-        problems.append(f"incorrect side effects: {case['marks']}")
-    if case["waiting"]:
+    expected_counts = shape["before"] if waiting else shape["after"]
+    actual_counts = path_counts(case["marks"])
+    if actual_counts != expected_counts:
+        problems.append(f"incorrect marker counts: {actual_counts} != {expected_counts}")
+    if any(mark["executed_by"] != ROLE for mark in case["marks"]):
+        problems.append("marker executed by unexpected role")
+    for path, expected in shape.get("before_values" if waiting else "after_values", {}).items():
+        values = [mark["value"] for mark in case["marks"] if mark["path"] == path]
+        if values != expected:
+            problems.append(f"incorrect marker values at {path}: {values} != {expected}")
+    if case["shape"] == "race":
+        if not case["race_loser_id"]:
+            problems.append("race loser child is missing")
+        if not case["race_loser_timer_created"]:
+            problems.append("race loser timer is not yet durable")
+        if waiting:
+            if case["race_loser_status"] != "running" or case["race_loser_cancelled"]:
+                problems.append("race loser must still be running before resume")
+        elif case["race_loser_status"] != "failed" or not case["race_loser_cancelled"]:
+            problems.append("race loser cancellation is not yet terminal")
+    if waiting:
         if not case["subscribed"]:
             problems.append("signal subscription is not yet durable")
     else:
-        result = json.loads(case["result"]) if case["result"] else None
-        if result != {"rows": [{"value": 42}], "row_count": 1}:
-            problems.append(f"incorrect result: {result}")
+        for path, value in shape.get("captured", {}).items():
+            values = [mark["value"] for mark in case["marks"] if mark["path"] == path]
+            if values != [value]:
+                problems.append(f"captured value at {path}: {values} != {[value]}")
+        expected_result = shape.get("result")
+        if expected_result is not None:
+            result = json.loads(case["result"]) if case["result"] else None
+            if result != expected_result:
+                problems.append(f"incorrect result: {result}")
         if case["name"] in completed and completed[case["name"]] != case["result"]:
             problems.append("previously completed result changed")
     return problems
@@ -233,7 +325,7 @@ def case_problems(case, completed):
 
 def exercise(cluster, previous, current, old_package, new_package, output):
     completed = {}
-    names = ["old-completed", "old-b1", "old-b2"]
+    names = [f"{family}-b1" for family in FAMILIES] + [f"{family}-b2" for family in FAMILIES]
 
     def check(phase, binary, schema):
         cluster.versions(binary, schema)
@@ -254,25 +346,34 @@ def exercise(cluster, previous, current, old_package, new_package, output):
         cluster.sql(f"GRANT USAGE ON SCHEMA {cluster.schema} TO {ROLE}; "
                     f"GRANT SELECT ON {cluster.schema}.instances, {cluster.schema}.executions, "
                     f"{cluster.schema}.history TO {ROLE};")
-        cluster.start_cases("old", ["b1", "b2"])
+        # Baseline: every family holds two N-1 instances at a durable suspension,
+        # plus a completed seq instance to track a byte-identical result.
+        cluster.seed_families()
+        cluster.start_sequence("seq-done-baseline")
+        names += ["seq-done-baseline"]
         check("baseline", previous, previous)
 
+        # B1: also create new-binary history to resume across the schema upgrade.
         cluster.stop()
         install(new_package, cluster.prefix)
         cluster.start()
         cluster.ready()
         check("b1-before-resume", current, previous)
-        cluster.release("old-b1")
-        cluster.start_cases("binary", ["b2"])
-        names += ["binary-completed", "binary-b2"]
+        for family in FAMILIES:
+            cluster.release(f"{family}-b1")
+        cluster.start_sequence("seq-done-b1")
+        cluster.start_sequence("seq-binary-b2", waiting=True)
+        names += ["seq-done-b1", "seq-binary-b2"]
         check("b1", current, previous)
 
+        # B2: new binary, new schema. Resume every -b2 case and start a fresh one.
         cluster.sql(f"ALTER EXTENSION pg_durable UPDATE TO {literal(current)};")
         check("b2-before-resume", current, current)
-        cluster.release("old-b2")
-        cluster.release("binary-b2")
-        cluster.start_cases("schema", [])
-        names += ["schema-completed"]
+        for family in FAMILIES:
+            cluster.release(f"{family}-b2")
+        cluster.release("seq-binary-b2")
+        cluster.start_sequence("seq-done-b2")
+        names += ["seq-done-b2"]
         check("b2", current, current)
     finally:
         cluster.stop()
