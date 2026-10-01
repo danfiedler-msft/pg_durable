@@ -70,6 +70,7 @@ For the same orchestration input and recorded history, code must produce the sam
 - Do not serialize unordered maps directly into activity, sub-orchestration, `continue_as_new`, or orchestration output payloads. Canonicalize map keys first; use `serialize_string_map` or `string_map_to_json` for string maps.
 - Do not select a "first" or "last" item from an unordered collection. Define the ordering explicitly.
 - When changing an orchestration or a transitive helper, consider replay of histories created by the previous binary. Treat changes to durable operation names, order, inputs, timers, branching, and returned output as in-flight compatibility changes.
+- Fresh-execution tests cannot prove replay compatibility. Follow the [Replay compatibility checklist](../CONTRIBUTING.md#replay-compatibility) for what to test, when to version or drain in-flight work, and when to extend the N-1 lifecycle.
 - Add determinism regression tests for order-sensitive logic. Construct logically identical maps in different insertion orders and assert byte-identical outputs; for substitution/transformation code, include values containing placeholder-like text to catch accidental rescanning.
 
 ### Activity Naming Convention
@@ -91,6 +92,8 @@ Tests in `tests/e2e/sql/` follow this pattern:
 
 ### Binary Backward Compatibility
 The new `.so` must work against **all** previous versions' schemas in the same major version, starting with v0.2.2, because customers may never run `ALTER EXTENSION UPDATE`. When changing SQL queries in Rust code, ensure they work against both old and new schemas (see [docs/upgrade-testing.md](../docs/upgrade-testing.md)). CI enforces this via `scripts/test-upgrade.sh`.
+
+Schema compatibility and **replay compatibility** are distinct. The new `.so` must also replay durable histories created by the previous binary. See [Replay sensitivity experiments](../docs/upgrade-testing.md#replay-sensitivity-experiments) for measured evidence and [Coverage boundaries and known gaps](../docs/upgrade-testing.md#coverage-boundaries-and-known-gaps) for its limits.
 
 ## Common Tasks
 

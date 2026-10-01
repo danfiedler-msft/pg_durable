@@ -178,6 +178,70 @@ printed `target/upgrade-lifecycle/` directory and uploaded by CI on failure.
 `--output-dir` selects a new evidence directory; `--timeout` controls each
 readiness/instance-validation deadline (default 60 seconds).
 
+#### Replay sensitivity experiments
+
+On 2026-09-30, four isolated source mutations demonstrated that the real N-1
+lifecycle catches replay breaks missed by fresh-execution tests. These are
+**historical measurements**, not an automatically maintained mutation suite.
+The predecessor was `v0.2.8`, the candidate was `0.2.9` at
+[89826bf](https://github.com/microsoft/pg_durable/commit/89826bf41c7628a050e3b636716b6424119d4642)
+from [PR #411](https://github.com/microsoft/pg_durable/pull/411), and PostgreSQL
+was 17.10. The unmodified candidate passed all lifecycle phases, validating 18
+instances. Each mutation separately passed **424 unit tests (16 ignored) and
+all 65 E2E tests**, but failed the lifecycle during B1 with
+`nondeterministic: schedule mismatch`.
+
+| Mutation | Observed replay rejection |
+|----------|---------------------------|
+| Rename `pg_durable::activity::execute-sql` to `pg_durable::activity::execute-sql-v2`, changing scheduling and registration together | Scheduled activity name differed from the recorded name |
+| Schedule JOIN branches right-to-left, then reverse collected results to preserve fresh output order | `join-b1` scheduled the right child where history recorded the left child |
+| Insert an unused `ctx.utc_now().await` before the loop's existing initial clock read | New clock operation appeared where history recorded `update-node-status` |
+| Add an ignored `"compat_version": 2` field to the SQL activity input | Scheduled input bytes differed despite backward-compatible deserialization |
+
+The same JOIN mutation also passed all 6 instances in the
+[PR #409 lifecycle](https://github.com/microsoft/pg_durable/commit/515908008fe582463f87f6d965d88edd495b7521).
+That lifecycle had no suspended JOIN history. Its rejection by #411 demonstrates
+the additional value of per-family suspension points, beyond simply testing an
+old binary. These results do not imply every future mutation will preserve
+fresh execution or that every replay break is covered.
+
+**Reproduction recipe (for those revisions):**
+
+1. Use a disposable checkout of `89826bf41c7628a050e3b636716b6424119d4642`,
+   fetch the `v0.2.8` tag, and install the normal pgrx build prerequisites with
+   PostgreSQL 17.10. Run the unmodified lifecycle command above first and require
+   success.
+2. Apply exactly one mutation, leaving the predecessor tag untouched:
+   - **Activity name:** change `NAME` in `src/activities/execute_sql.rs`; both
+     scheduling and registration use that constant.
+   - **JOIN order:** in `src/orchestrations/execute_function_graph.rs`, replace
+     `for child_root in &branch_ids` with
+     `for child_root in branch_ids.iter().rev()`. Make the result of
+     `ctx.join(durable_futures).await` mutable and call `results_vec.reverse()`
+     immediately afterward.
+   - **Loop clock:** in the same orchestration file, insert
+     `let _ = ctx.utc_now().await;` immediately before
+     `let iter_started = ctx.utc_now().await.ok();`.
+   - **Input bytes:** in the same file, add `"compat_version": 2,` to the SQL
+     activity input JSON object alongside `query`, `submitted_by`, and `database`.
+3. Run `./scripts/test-unit.sh`, `./scripts/test-e2e-local.sh`, and the lifecycle
+   command above. Require fresh-execution tests to pass, the N-1 baseline to
+   validate, and B1 to fail with the corresponding mismatch in the table.
+   A build failure, timeout, or unrelated replay mismatch is not confirmation.
+4. Use a clean checkout for each mutation. To reproduce the JOIN comparison,
+   repeat only that mutation and the lifecycle at
+   `515908008fe582463f87f6d965d88edd495b7521`; expect the lifecycle to pass.
+
+The ordinary, unmodified lifecycle remains in required PR CI. There is no
+scheduled mutation workflow or mutation-based release gate. Repeating these
+experiments would check the **test harness's sensitivity**, not establish that
+an unmodified release is compatible. Repeat a targeted experiment when
+materially changing the lifecycle harness, suspended-history fixtures, or
+replay validation (including relevant duroxide updates), rather than on a
+calendar. Always establish an unmodified passing baseline first. Adapt the
+mutation deliberately when testing newer source; these recipes do not promise
+stable source anchors.
+
 #### Upgrade & Migration
 
 This change affects test infrastructure only. It adds no extension DDL,
@@ -185,6 +249,33 @@ upgrade-script changes or production runtime detection. B1's supported-schema
 contract is unchanged. Test-only provider-schema discovery handles the existing
 `duroxide` and `_duroxide` layouts; provider migrations during candidate worker
 startup remain part of the real binary-upgrade test.
+
+The experiment record and contributor guidance are documentation only and
+require no additional migration changes. Reproduction mutations belong only in
+disposable checkouts, never in a release.
+
+### Coverage boundaries and known gaps
+
+The real previous-binary lifecycle provides in-flight replay evidence for a
+specific, bounded slice. This section is the canonical statement of what that
+evidence does and does **not** establish. Open a focused
+issue for any row the project intends to close, and link it here.
+
+| Dimension | Current evidence | Not yet covered |
+|-----------|------------------|-----------------|
+| Real binary history depth | Immediate predecessor (N-1) only | Real histories created by every supported older binary, and multi-hop upgrade chains |
+| Behavior-shape breadth | One suspended instance each for `seq`, both `if` branches, `loop`, `break`, `join`, `race` | Nested permutations and suspension at every durable boundary within a shape |
+| Node/activity breadth | `df.sql`, signals and timers are exercised | HTTP, multipart, table sinks, `wait_for_schedule`, retry/failure paths, and other specialized activity payloads |
+| Schema breadth | The candidate `.so` is checked against every supported schema (Guarantee B1); real old-binary history is N-1 only | Real old-binary histories replayed against every supported schema |
+| Provider-version changes | Provider startup and migrations run during the lifecycle | A deliberate old/new `duroxide-pg` provider-version transition matrix (see #398 findings) |
+| Packaging and platforms | Source-built tagged predecessor on the CI PostgreSQL and platform | Published package artifacts, other PostgreSQL majors, and other OS/arch combinations |
+| Release binding | Unmodified lifecycle in required PR CI | Publication does not require a successful lifecycle run against the exact release commit |
+| Compatibility policy | Fail-closed lifecycle; release notes record individual accepted breaks and drain contracts | A centralized inventory of accepted replay breaks, a versioning strategy, and a stated support window |
+
+Closed [PR #398](https://github.com/microsoft/pg_durable/pull/398) is useful
+prior art for the historical-chain approach and a measured-incompatibility
+inventory, but a closed PR is not a tracker. Surviving gaps belong in this
+matrix with issues attached.
 
 ## Backward Compatibility Patterns
 
