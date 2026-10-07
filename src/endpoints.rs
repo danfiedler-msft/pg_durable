@@ -533,12 +533,12 @@ impl<'a> EndpointCatalog<'a> {
                 "SELECT EXISTS (
                     SELECT 1 FROM pg_catalog.pg_foreign_data_wrapper AS wrapper
                     JOIN pg_catalog.pg_depend AS dependency
-                      ON dependency.classid = 'pg_catalog.pg_foreign_data_wrapper'::pg_catalog.regclass
-                     AND dependency.objid = wrapper.oid
-                     AND dependency.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass
-                     AND dependency.deptype = 'e'
-                    JOIN pg_catalog.pg_extension AS extension ON extension.oid = dependency.refobjid
-                    WHERE wrapper.fdwname = $1 AND extension.extname = 'pg_durable'
+                      ON dependency.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_foreign_data_wrapper'::pg_catalog.regclass
+                     AND dependency.objid OPERATOR(pg_catalog.=) wrapper.oid
+                     AND dependency.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_extension'::pg_catalog.regclass
+                     AND dependency.deptype OPERATOR(pg_catalog.=) 'e'
+                    JOIN pg_catalog.pg_extension AS extension ON extension.oid OPERATOR(pg_catalog.=) dependency.refobjid
+                    WHERE wrapper.fdwname OPERATOR(pg_catalog.=) $1 AND extension.extname OPERATOR(pg_catalog.=) 'pg_durable'
                 )",
             )
             .bind(FDW_NAME)
@@ -565,12 +565,12 @@ impl<'a> EndpointCatalog<'a> {
                 .map_err(|error| format!("Endpoint server {server:?}: {error}"))?;
             let endpoint: Option<(i64, bool, bool, Option<Vec<String>>)> = sqlx::query_as(
                 "SELECT server.oid::pg_catalog.int8,
-                        wrapper.fdwname = $2,
+                        wrapper.fdwname OPERATOR(pg_catalog.=) $2,
                         pg_catalog.has_server_privilege(server.oid, 'USAGE'),
                         server.srvoptions
                  FROM pg_catalog.pg_foreign_server AS server
-                 JOIN pg_catalog.pg_foreign_data_wrapper AS wrapper ON wrapper.oid = server.srvfdw
-                 WHERE server.srvname = $1",
+                 JOIN pg_catalog.pg_foreign_data_wrapper AS wrapper ON wrapper.oid OPERATOR(pg_catalog.=) server.srvfdw
+                 WHERE server.srvname OPERATOR(pg_catalog.=) $1",
             )
             .bind(server)
             .bind(FDW_NAME)
@@ -663,10 +663,10 @@ async fn load_user_mapping(
     let mapping: Option<Option<Vec<String>>> = sqlx::query_scalar(
         "SELECT mapping.umoptions
              FROM pg_catalog.pg_user_mappings AS mapping
-             WHERE mapping.srvid::pg_catalog.int8 = $1
-               AND mapping.umuser = (
+             WHERE mapping.srvid::pg_catalog.int8 OPERATOR(pg_catalog.=) $1
+               AND mapping.umuser OPERATOR(pg_catalog.=) (
                    SELECT role.oid FROM pg_catalog.pg_roles AS role
-                   WHERE role.rolname = CURRENT_USER
+                   WHERE role.rolname OPERATOR(pg_catalog.=) CURRENT_USER
                )",
     )
     .bind(server_oid)
@@ -962,11 +962,15 @@ mod tests {
         let admin = Spi::get_one::<String>("SELECT current_user::text")
             .unwrap()
             .unwrap();
-        let database = Spi::get_one::<String>("SELECT current_database()::text")
+        let shared_database = Spi::get_one::<String>("SELECT current_database()::text")
             .unwrap()
             .unwrap();
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-            let mut connection = crate::origin::metadata_test_connection(&admin, &database).await;
+            let test_admin = admin.clone();
+            let test_shared_database = shared_database.clone();
+            crate::origin::with_metadata_test_database(&admin, &shared_database, move |database| async move {
+            let admin = test_admin;
+            let mut connection = crate::types::connect_as_user(&admin, Some(&database)).await.unwrap();
             let (database_oid, installation_id): (i64, uuid::Uuid) = sqlx::query_as(
                 "SELECT d.oid::bigint, i.id FROM pg_catalog.pg_database d CROSS JOIN df._installation i
                  WHERE d.datname = pg_catalog.current_database()",
@@ -1009,6 +1013,7 @@ mod tests {
                 assert!(error.contains("Endpoint origin fence unavailable"), "{error}");
                 assert!(!error.contains("ENDPOINT_ORIGIN_CANARY"));
             }
+            crate::origin::assert_shared_metadata_usable(&admin, &test_shared_database).await;
             catalog.close().await.unwrap();
             sqlx::raw_sql(
                 "DROP VIEW df._installation;
@@ -1022,6 +1027,7 @@ mod tests {
             assert_eq!((isolation.as_str(), read_only.as_str()), ("repeatable read", "on"));
             catalog.close().await.unwrap();
             connection.close().await.unwrap();
+            }).await;
         });
     }
 
